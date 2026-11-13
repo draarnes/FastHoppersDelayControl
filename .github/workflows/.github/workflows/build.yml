@@ -1,0 +1,213 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.1'
+      - name: Write project files
+        run: |
+          mkdir -p "$(dirname settings.gradle)"
+          cat > settings.gradle <<'EOF_471'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = 'hopper-delay-control'
+          EOF_471
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF_7845'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.11
+          loader_version=0.19.2
+          fabric_version=0.141.6+1.21.11
+
+          mod_version=1.0.0
+          maven_group=dev.hopperdelay
+          archives_base_name=hopper-delay-control
+          EOF_7845
+          mkdir -p "$(dirname build.gradle)"
+          cat > build.gradle <<'EOF_303'
+          plugins {
+              id 'fabric-loom' version '1.16-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF_303
+          mkdir -p "$(dirname src/main/resources/fabric.mod.json)"
+          cat > src/main/resources/fabric.mod.json <<'EOF_5951'
+          {
+            "schemaVersion": 1,
+            "id": "hopperdelaycontrol",
+            "version": "${version}",
+            "name": "Hopper Delay Control",
+            "description": "Adds /hopperdelay and /hoppercartdelay so the two Fast Hoppers gamerules can be changed without cheats or op.",
+            "authors": [],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": ["dev.hopperdelay.HopperDelayControl"]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.2",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*",
+              "fasthoppers": "*"
+            }
+          }
+          EOF_5951
+          mkdir -p "$(dirname src/main/java/dev/hopperdelay/HopperDelayControl.java)"
+          cat > src/main/java/dev/hopperdelay/HopperDelayControl.java <<'EOF_1432'
+          package dev.hopperdelay;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.world.level.gamerules.GameRule;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          /**
+           * Lets anyone change the two Fast Hoppers gamerules, even when cheats are off.
+           *
+           * <p>/gamerule is gated behind permission level 2, and that is not something we can loosen for
+           * only two rules. So this adds two small commands with NO permission requirement that write to
+           * the very same gamerules:
+           *
+           * <pre>
+           *   /hopperdelay [ticks]      -> fasthoppers:hopper_transfer_delay          (default 8)
+           *   /hoppercartdelay [ticks]  -> fasthoppers:hopper_minecart_transfer_delay (default 1)
+           * </pre>
+           *
+           * With no argument a command just prints the current value. Fast Hoppers keeps working exactly
+           * as before; /gamerule still works for anyone who has permission.
+           *
+           * <p>The GameRule objects are taken from Fast Hoppers' own public fields, via reflection, so this
+           * mod needs no compile-time dependency on it and cannot register a duplicate rule.
+           */
+          public class HopperDelayControl implements ModInitializer {
+
+              public static final String MOD_ID = "hopperdelaycontrol";
+              private static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+
+              private static final String FAST_HOPPERS_RULES_CLASS = "gay.bagel.fasthoppers.FastHoppersGameRules";
+
+              @Override
+              public void onInitialize() {
+                  CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+                      register(dispatcher, "hopperdelay",
+                              "HOPPER_TRANSFER_DELAY", "fasthoppers:hopper_transfer_delay");
+                      register(dispatcher, "hoppercartdelay",
+                              "HOPPER_MINECART_TRANSFER_DELAY", "fasthoppers:hopper_minecart_transfer_delay");
+                  });
+              }
+
+              private static void register(CommandDispatcher<CommandSourceStack> dispatcher,
+                                           String command, String field, String ruleName) {
+                  // Deliberately no .requires(...): that is the whole point of this mod.
+                  dispatcher.register(Commands.literal(command)
+                          .executes(ctx -> show(ctx.getSource(), field, ruleName))
+                          .then(Commands.argument("ticks", IntegerArgumentType.integer(1))
+                                  .executes(ctx -> set(ctx.getSource(), field, ruleName,
+                                          IntegerArgumentType.getInteger(ctx, "ticks")))));
+              }
+
+              private static int show(CommandSourceStack source, String field, String ruleName) {
+                  GameRule<Integer> rule = lookup(source, field, ruleName);
+                  if (rule == null) {
+                      return 0;
+                  }
+                  int value = source.getServer().overworld().getGameRules().get(rule);
+                  source.sendSuccess(() -> Component.literal(ruleName + " is currently " + value), false);
+                  return value;
+              }
+
+              private static int set(CommandSourceStack source, String field, String ruleName, int ticks) {
+                  GameRule<Integer> rule = lookup(source, field, ruleName);
+                  if (rule == null) {
+                      return 0;
+                  }
+                  MinecraftServer server = source.getServer();
+                  server.overworld().getGameRules().set(rule, ticks, server);
+                  source.sendSuccess(() -> Component.literal("Set " + ruleName + " to " + ticks), true);
+                  return ticks;
+              }
+
+              @SuppressWarnings("unchecked")
+              private static GameRule<Integer> lookup(CommandSourceStack source, String field, String ruleName) {
+                  try {
+                      Object value = Class.forName(FAST_HOPPERS_RULES_CLASS).getField(field).get(null);
+                      if (value instanceof GameRule<?> rule) {
+                          return (GameRule<Integer>) rule;
+                      }
+                      source.sendFailure(Component.literal(ruleName + " is not registered yet"));
+                  } catch (ReflectiveOperationException e) {
+                      LOGGER.error("Could not find {} in {}", field, FAST_HOPPERS_RULES_CLASS, e);
+                      source.sendFailure(Component.literal(
+                              "Could not find the Fast Hoppers gamerule " + ruleName
+                                      + " (is this a different Fast Hoppers version?)"));
+                  }
+                  return null;
+              }
+          }
+          EOF_1432
+      - name: Build
+        run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hopper-delay-control
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
